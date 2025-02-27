@@ -496,6 +496,11 @@ class BayesSearchCV(BaseSearchCV):
 
         n_points = self.n_points
 
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            tqdm = None
+
         for search_space, optimizer in zip(search_spaces, optimizers):
             # if not provided with search subspace, n_iter is taken as
             # self.n_iter
@@ -503,6 +508,12 @@ class BayesSearchCV(BaseSearchCV):
                 search_space, n_iter = search_space
             else:
                 n_iter = self.n_iter
+
+            if self.verbose == 0 and (tqdm is not None):
+                progress = tqdm(total=n_iter, 
+                    desc=f"{self.__class__.__name__} across {n_iter} test points...")
+            else:
+                progress = None
 
             # do the optimization for particular search space
             while n_iter > 0:
@@ -514,6 +525,8 @@ class BayesSearchCV(BaseSearchCV):
                     evaluate_candidates, n_points=n_points_adjusted
                 )
                 n_iter -= n_points
+                if progress is not None:
+                    progress.update(n_points_adjusted)
 
                 if eval_callbacks(callbacks, optim_result):
                     break
