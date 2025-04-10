@@ -4,9 +4,9 @@
 
 .. _changes_0_9:
 
-Version 0.9.0
+Version 0.9.1
 =============
-**October 2021**
+**February 2025**
 
 - |Fix| :obj:`skopt.learning.gaussian_process.gpr.GaussianProcessRegressor`
   for sklearn >= 0.23. :pr:`943`
