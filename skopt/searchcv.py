@@ -6,6 +6,7 @@ except ImportError:
     from collections import Sized
 
 import numpy as np
+from copy import deepcopy
 from scipy.stats import rankdata
 
 from sklearn.model_selection._search import BaseSearchCV
@@ -131,6 +132,9 @@ class BayesSearchCV(BaseSearchCV):
 
     verbose : integer
         Controls the verbosity: the higher, the more messages.
+
+    progress_bar : boolean, default=True
+        If ``True``, a progress bar is shown during the search.
 
     random_state : int or RandomState
         Pseudo random number generator state used for random uniform sampling
@@ -280,7 +284,8 @@ class BayesSearchCV(BaseSearchCV):
 
     def __init__(self, estimator, search_spaces, optimizer_kwargs=None,
                  n_iter=50, scoring=None, fit_params=None, n_jobs=1,
-                 n_points=1, iid='deprecated', refit=True, cv=None, verbose=0,
+                 n_points=1, iid='deprecated', refit=True, cv=None, 
+                 verbose=0, progress_bar=True,
                  pre_dispatch='2*n_jobs', random_state=None,
                  error_score='raise', return_train_score=False):
 
@@ -306,6 +311,7 @@ class BayesSearchCV(BaseSearchCV):
              n_jobs=n_jobs, refit=refit, cv=cv, verbose=verbose,
              pre_dispatch=pre_dispatch, error_score=error_score,
              return_train_score=return_train_score)
+        self.progress_bar = progress_bar
 
     def _check_search_space(self, search_space):
         """Checks whether the search space argument is correct"""
@@ -479,7 +485,7 @@ class BayesSearchCV(BaseSearchCV):
         if isinstance(search_spaces, dict):
             search_spaces = [search_spaces]
 
-        callbacks = self._callbacks
+        callbacks = deepcopy(self._callbacks)
 
         random_state = check_random_state(self.random_state)
         self.optimizer_kwargs_['random_state'] = random_state
@@ -501,7 +507,7 @@ class BayesSearchCV(BaseSearchCV):
         except ImportError:
             tqdm = None
 
-        for search_space, optimizer in zip(search_spaces, optimizers):
+        for spc_idx, (search_space, optimizer) in enumerate(zip(search_spaces, optimizers)):
             # if not provided with search subspace, n_iter is taken as
             # self.n_iter
             if isinstance(search_space, tuple):
@@ -509,9 +515,26 @@ class BayesSearchCV(BaseSearchCV):
             else:
                 n_iter = self.n_iter
 
-            if self.verbose == 0 and (tqdm is not None):
-                progress = tqdm(total=n_iter, 
-                    desc=f"{self.__class__.__name__} across {n_iter} test points...")
+            if self.progress_bar and self.verbose == 0:
+                if (tqdm is None):
+                    progress = None
+                    warnings.warn('progress_bar request, but `tqdm` package is not installed.')
+                else:
+                    progress = tqdm(total=n_iter, 
+                        desc=f"{self.__class__.__name__} across {n_iter} test points...")
+                    
+                    if spc_idx == 0:
+                        def on_step(optim_result):
+                            score = -optim_result['fun']
+                            med = np.median(-optim_result['func_vals'])
+                            progress.set_description(f"{self.__class__.__name__} across {n_iter} "
+                                                     "(remaining) test points "
+                                                     f"[best score: {score:.3g}, median: {med:.3g})")
+                            # if score >= 0.99:
+                            #     # progress.close()
+                            #     print('Interrupting!')
+                            return False
+                        callbacks.append(on_step)
             else:
                 progress = None
 
@@ -531,3 +554,5 @@ class BayesSearchCV(BaseSearchCV):
                 if eval_callbacks(callbacks, optim_result):
                     break
             self._optim_results.append(optim_result)
+            if progress is not None:
+                progress.close()
