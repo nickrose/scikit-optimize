@@ -32,7 +32,8 @@ class _CVQuitEarlyMixin:
     ``evaluate_candidates(candidate_params)`` with plain parameter dicts --
     true of :class:`BayesSearchCV`, sklearn's ``GridSearchCV`` and
     ``RandomizedSearchCV`` alike. See :class:`BayesSearchCV` for parameter
-    docs (``cv_quit_early``, ``cv_quit_after_n_folds``, ``cv_quit_margin``).
+    docs (``cv_quit_early``, ``cv_quit_after_n_folds``, ``cv_quit_margin``,
+    ``cv_quit_min_completed``).
     """
 
     def _fit_with_cv_quit_early(self, X, y=None, groups=None, **fit_params):
@@ -42,12 +43,17 @@ class _CVQuitEarlyMixin:
         always scores every candidate against every CV fold) and instead
         scores each candidate's folds sequentially, abandoning the remaining
         folds for a candidate once ``cv_quit_after_n_folds`` folds look
-        clearly worse than the best fully-evaluated candidate so far. Does
-        not support ``return_train_score`` or sample-aligned fit params
+        clearly worse than other candidates' scores *at that same fold
+        count* (a median-stopping-rule style comparison — see
+        ``cv_quit_margin``). Pruning only activates once
+        ``cv_quit_min_completed`` candidates have run to completion, so a
+        handful of early, possibly-unrepresentative trials can't distort the
+        threshold before the search has any real sense of the score spread.
+        Does not support ``return_train_score`` or sample-aligned fit params
         (sample_weight etc.) — add if/when needed.
         """
         from sklearn.model_selection._validation import _fit_and_score
-        from sklearn.model_selection import check_cv
+        from sklearn.model_selection import check_cv, StratifiedKFold, KFold
         from sklearn.base import clone, is_classifier
         from sklearn.utils.validation import indexable
         from joblib import Parallel, delayed
@@ -57,23 +63,75 @@ class _CVQuitEarlyMixin:
         self.scorer_ = scorer
 
         X, y = indexable(X, y)
-        cv_orig = check_cv(self.cv, y, classifier=is_classifier(estimator))
+
+        # A candidate's first `cv_quit_after_n_folds` folds stand in for the
+        # whole CV score when deciding whether to prune it -- that's only a
+        # fair sample if fold order isn't correlated with anything (row
+        # order, label order, ...). Force a shuffled splitter whenever the
+        # caller left `cv` as a bare fold count (or default), so early-quit
+        # comparisons aren't biased by unshuffled fold order. A `cv` that's
+        # already an explicit splitter/iterable is left alone.
+        cv_arg = self.cv
+        if isinstance(cv_arg, (int, np.integer)) or cv_arg is None:
+            n_splits_req = 5 if cv_arg is None else int(cv_arg)
+            seed = getattr(self, 'random_state', None)
+            if is_classifier(estimator):
+                cv_arg = StratifiedKFold(n_splits=n_splits_req, shuffle=True,
+                                         random_state=seed)
+            else:
+                cv_arg = KFold(n_splits=n_splits_req, shuffle=True,
+                               random_state=seed)
+            warnings.warn(
+                f'cv_quit_early=True: cv={self.cv!r} replaced with a shuffled '
+                f'{cv_arg.__class__.__name__}(n_splits={n_splits_req}, '
+                f'shuffle=True) so the first cv_quit_after_n_folds folds used '
+                f'for early-quit comparisons are a representative sample '
+                f'rather than being biased by row order.')
+
+        cv_orig = check_cv(cv_arg, y, classifier=is_classifier(estimator))
         splits = list(cv_orig.split(X, y, groups=groups))
         n_splits = len(splits)
         n_quit = min(self.cv_quit_after_n_folds, n_splits)
         can_quit_early = n_quit < n_splits
+        min_completed = max(1, getattr(self, 'cv_quit_min_completed', 5))
 
         all_candidate_params = []
         all_rows = []
         results = {}
 
         def _current_quit_threshold():
-            full_means = [r['mean_test_score'] for r in all_rows
-                          if not r['early_quit']]
-            if len(full_means) < 1:
+            # Require a real warm-up of fully-evaluated candidates before
+            # trusting any spread estimate -- with too few completions the
+            # observed spread is itself noise, and pruning off that noise
+            # can knock out good regions before the search has explored
+            # enough to know better.
+            n_completed = sum(1 for r in all_rows if not r['early_quit'])
+            if n_completed < min_completed:
                 return None
-            best = max(full_means)
-            spread = (max(full_means) - min(full_means)) if len(full_means) > 1 \
+            # Compare against other candidates' scores at the *same* fold
+            # count (partial-vs-partial), not fully-evaluated candidates'
+            # full-fold mean -- comparing a 3-fold partial mean to a 5-fold
+            # full mean is apples-to-oranges whenever folds differ in
+            # difficulty, and systematically over-prunes. But partial scores
+            # only exist for candidates that already reached the
+            # cv_quit_after_n_folds mark, so early on there may not be
+            # enough of them yet even once cv_quit_min_completed is
+            # satisfied (e.g. cv_quit_min_completed=1). Rather than block
+            # pruning indefinitely on "not enough partial history", fall
+            # back to the (noisier, apples-to-oranges) full-fold-mean
+            # comparison until at least 3 partial scores have accumulated,
+            # then switch over to the fairer partial-vs-partial comparison.
+            partial_scores = [r['partial_score_at_quit'] for r in all_rows
+                              if r['partial_score_at_quit'] is not None]
+            if len(partial_scores) >= 3:
+                scores = partial_scores
+            else:
+                scores = [r['mean_test_score'] for r in all_rows
+                         if not r['early_quit']]
+            if len(scores) < 1:
+                return None
+            best = max(scores)
+            spread = (max(scores) - min(scores)) if len(scores) > 1 \
                 else max(abs(best), 1e-6)
             return best - self.cv_quit_margin * spread
 
@@ -81,6 +139,7 @@ class _CVQuitEarlyMixin:
             split_scores = [np.nan] * n_splits
             fit_times = [np.nan] * n_splits
             early_quit = False
+            partial_score_at_quit = None
             for split_idx, (train, test) in enumerate(splits):
                 est = clone(estimator)
                 est.set_params(**parameters)
@@ -93,9 +152,9 @@ class _CVQuitEarlyMixin:
                 fit_times[split_idx] = res['fit_time']
 
                 if can_quit_early and (split_idx + 1) == n_quit:
+                    partial_score_at_quit = float(np.nanmean(split_scores[:n_quit]))
                     threshold = _current_quit_threshold()
-                    partial_mean = float(np.nanmean(split_scores))
-                    if threshold is not None and partial_mean < threshold:
+                    if threshold is not None and partial_score_at_quit < threshold:
                         early_quit = True
                         break
 
@@ -107,16 +166,34 @@ class _CVQuitEarlyMixin:
                 'mean_fit_time': float(np.nanmean(fit_times)),
                 'n_folds_evaluated': (n_quit if early_quit else n_splits),
                 'early_quit': early_quit,
+                'partial_score_at_quit': partial_score_at_quit,
             }
+
+        # GridSearchCV/RandomizedSearchCV hand the *entire* candidate list to
+        # evaluate_candidates() in one call (unlike BayesSearchCV, which asks
+        # for n_points at a time) -- dispatched to Parallel() as a single
+        # batch, every worker would see `all_rows` exactly as it was before
+        # the call started, so early-quit could never trigger past the first
+        # batch. Chunk internally so results become visible (and pruning can
+        # kick in) between chunks, while still parallelising within a chunk.
+        if isinstance(self.n_jobs, int) and self.n_jobs > 0:
+            chunk_size = self.n_jobs
+        elif self.n_jobs in (None, 0):
+            chunk_size = 1
+        else:
+            import os
+            chunk_size = os.cpu_count() or 4
 
         def evaluate_candidates(candidate_params):
             nonlocal results
             candidate_params = list(candidate_params)
-            rows = Parallel(n_jobs=self.n_jobs, pre_dispatch=self.pre_dispatch)(
-                delayed(_eval_one)(p) for p in candidate_params)
 
-            all_candidate_params.extend(candidate_params)
-            all_rows.extend(rows)
+            for start in range(0, len(candidate_params), chunk_size):
+                chunk = candidate_params[start:start + chunk_size]
+                rows = Parallel(n_jobs=self.n_jobs, pre_dispatch=self.pre_dispatch)(
+                    delayed(_eval_one)(p) for p in chunk)
+                all_candidate_params.extend(chunk)
+                all_rows.extend(rows)
 
             results = {
                 'params': list(all_candidate_params),
@@ -276,14 +353,20 @@ class BayesSearchCV(_CVQuitEarlyMixin, BaseSearchCV):
     cv_quit_early : bool, default=False
         If True, evaluate each candidate's CV folds sequentially and
         abandon the remaining folds once ``cv_quit_after_n_folds`` have
-        been scored and the partial mean is judged "bad" relative to the
-        best fully-evaluated candidate seen so far (see
+        been scored and the partial score is judged "bad" relative to
+        other candidates' scores *at that same fold count* (see
         ``cv_quit_margin``). Skipped folds are recorded as NaN in
         ``cv_results_`` and the candidate's ``mean_test_score`` is the
         mean of the folds that *were* run, so early-quit candidates are
         still comparable (if pessimistic) for the optimizer's ``tell()``.
-        Only takes effect once at least one candidate has completed all
-        folds (there's nothing to compare against before that).
+        Only takes effect once ``cv_quit_min_completed`` candidates have
+        run to completion — see that parameter. Also forces a *shuffled*
+        splitter (``StratifiedKFold``/``KFold`` with ``shuffle=True``)
+        whenever ``cv`` is left as a bare fold count or ``None``, so the
+        first ``cv_quit_after_n_folds`` folds used for pruning decisions
+        are a representative sample rather than being biased by row order
+        (logged via a ``warnings.warn`` the first time it happens; an
+        explicit splitter/iterable passed as ``cv`` is left untouched).
 
     cv_quit_after_n_folds : int, default=3
         Number of folds to run before checking whether to quit early.
@@ -291,13 +374,30 @@ class BayesSearchCV(_CVQuitEarlyMixin, BaseSearchCV):
         produces this many folds or fewer (nothing to quit early from).
 
     cv_quit_margin : float, default=0.5
-        Tolerance band, as a fraction of the observed spread of fully-
-        evaluated candidates' mean scores. A candidate quits early when
-        its partial mean score falls below
-        ``best_full_mean_score - cv_quit_margin * score_spread``
-        (scores are "higher is better", matching sklearn scorer
-        convention — e.g. ``neg_brier_score``). Larger values prune more
-        aggressively.
+        Tolerance band, as a fraction of the observed spread of other
+        candidates' scores. Once at least 3 candidates have a recorded
+        partial score at the same ``cv_quit_after_n_folds`` fold count, the
+        comparison uses those partial scores (partial-vs-partial — comparing
+        a 3-fold partial mean to a 5-fold full mean is apples-to-oranges
+        whenever folds differ in difficulty, and would systematically
+        over-prune). Before that many partial scores exist, falls back to
+        comparing against completed candidates' full-fold ``mean_test_score``
+        instead, so pruning isn't blocked from ever engaging just because
+        partial-score history hasn't accumulated yet. A candidate quits
+        early when its partial score falls below
+        ``best_score - cv_quit_margin * score_spread`` under whichever
+        basis is active (scores are "higher is better", matching sklearn
+        scorer convention — e.g. ``neg_brier_score``). Larger values prune
+        more aggressively.
+
+    cv_quit_min_completed : int, default=5
+        Minimum number of candidates that must have run to full completion
+        (all folds) before early-quitting is allowed to trigger for any
+        candidate. With too few completions, the observed score spread is
+        itself noisy, and pruning based on it risks throwing away a
+        genuinely good but not-yet-explored region of the search space
+        before the search has any real sense of where "bad" begins.
+        Ignored if ``cv_quit_early`` is False.
 
     random_state : int or RandomState
         Pseudo random number generator state used for random uniform sampling
@@ -452,7 +552,7 @@ class BayesSearchCV(_CVQuitEarlyMixin, BaseSearchCV):
                  pre_dispatch='2*n_jobs', random_state=None,
                  error_score='raise', return_train_score=False,
                  cv_quit_early=False, cv_quit_after_n_folds=3,
-                 cv_quit_margin=0.5):
+                 cv_quit_margin=0.5, cv_quit_min_completed=5):
 
         self.search_spaces = search_spaces
         self.n_iter = n_iter
@@ -474,6 +574,7 @@ class BayesSearchCV(_CVQuitEarlyMixin, BaseSearchCV):
         self.cv_quit_early = cv_quit_early
         self.cv_quit_after_n_folds = cv_quit_after_n_folds
         self.cv_quit_margin = cv_quit_margin
+        self.cv_quit_min_completed = cv_quit_min_completed
 
         super(BayesSearchCV, self).__init__(
              estimator=estimator, scoring=scoring,
@@ -732,17 +833,18 @@ class BayesSearchCV(_CVQuitEarlyMixin, BaseSearchCV):
 class GridSearchCV(_CVQuitEarlyMixin, _SkGridSearchCV):
     """``sklearn.model_selection.GridSearchCV`` with the same
     ``cv_quit_early`` early-abandonment option as :class:`BayesSearchCV`.
-    See :class:`BayesSearchCV` for the three added parameters' docs.
+    See :class:`BayesSearchCV` for the four added parameters' docs.
     """
 
     def __init__(self, estimator, param_grid, *, scoring=None, n_jobs=None,
                  refit=True, cv=None, verbose=0, pre_dispatch='2*n_jobs',
                  error_score=np.nan, return_train_score=False,
                  cv_quit_early=False, cv_quit_after_n_folds=3,
-                 cv_quit_margin=0.5):
+                 cv_quit_margin=0.5, cv_quit_min_completed=5):
         self.cv_quit_early = cv_quit_early
         self.cv_quit_after_n_folds = cv_quit_after_n_folds
         self.cv_quit_margin = cv_quit_margin
+        self.cv_quit_min_completed = cv_quit_min_completed
         super().__init__(
             estimator=estimator, param_grid=param_grid, scoring=scoring,
             n_jobs=n_jobs, refit=refit, cv=cv, verbose=verbose,
@@ -758,7 +860,7 @@ class GridSearchCV(_CVQuitEarlyMixin, _SkGridSearchCV):
 class RandomizedSearchCV(_CVQuitEarlyMixin, _SkRandomizedSearchCV):
     """``sklearn.model_selection.RandomizedSearchCV`` with the same
     ``cv_quit_early`` early-abandonment option as :class:`BayesSearchCV`.
-    See :class:`BayesSearchCV` for the three added parameters' docs.
+    See :class:`BayesSearchCV` for the four added parameters' docs.
     """
 
     def __init__(self, estimator, param_distributions, *, n_iter=10,
@@ -766,10 +868,11 @@ class RandomizedSearchCV(_CVQuitEarlyMixin, _SkRandomizedSearchCV):
                  pre_dispatch='2*n_jobs', random_state=None,
                  error_score=np.nan, return_train_score=False,
                  cv_quit_early=False, cv_quit_after_n_folds=3,
-                 cv_quit_margin=0.5):
+                 cv_quit_margin=0.5, cv_quit_min_completed=5):
         self.cv_quit_early = cv_quit_early
         self.cv_quit_after_n_folds = cv_quit_after_n_folds
         self.cv_quit_margin = cv_quit_margin
+        self.cv_quit_min_completed = cv_quit_min_completed
         super().__init__(
             estimator=estimator, param_distributions=param_distributions,
             n_iter=n_iter, scoring=scoring, n_jobs=n_jobs, refit=refit,
