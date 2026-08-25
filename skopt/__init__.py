@@ -52,7 +52,7 @@ else:
     from .optimizer import gbrt_minimize
     from .optimizer import gp_minimize
     from .optimizer import Optimizer
-    from .searchcv import BayesSearchCV
+    from .searchcv import BayesSearchCV, GridSearchCV, RandomizedSearchCV
     from .space import Space
     from .utils import dump
     from .utils import expected_minimum
@@ -76,6 +76,8 @@ else:
         "load",
         "expected_minimum",
         "BayesSearchCV",
+        "GridSearchCV",
+        "RandomizedSearchCV",
         "Space"
     )
     IS_PYPY = platform.python_implementation() == 'PyPy'

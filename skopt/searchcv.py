@@ -10,6 +10,8 @@ from copy import deepcopy
 from scipy.stats import rankdata
 
 from sklearn.model_selection._search import BaseSearchCV
+from sklearn.model_selection import GridSearchCV as _SkGridSearchCV
+from sklearn.model_selection import RandomizedSearchCV as _SkRandomizedSearchCV
 from sklearn.utils import check_random_state
 
 from sklearn.utils.validation import check_is_fitted
@@ -24,7 +26,142 @@ from .space import check_dimension
 from .callbacks import check_callback
 
 
-class BayesSearchCV(BaseSearchCV):
+class _CVQuitEarlyMixin:
+    """Shared ``cv_quit_early`` fit path for any ``BaseSearchCV`` subclass
+    whose ``_run_search(evaluate_candidates)`` calls
+    ``evaluate_candidates(candidate_params)`` with plain parameter dicts --
+    true of :class:`BayesSearchCV`, sklearn's ``GridSearchCV`` and
+    ``RandomizedSearchCV`` alike. See :class:`BayesSearchCV` for parameter
+    docs (``cv_quit_early``, ``cv_quit_after_n_folds``, ``cv_quit_margin``).
+    """
+
+    def _fit_with_cv_quit_early(self, X, y=None, groups=None, **fit_params):
+        """Custom fit loop used when ``cv_quit_early=True``.
+
+        Bypasses ``BaseSearchCV.fit``'s all-folds-always evaluation (which
+        always scores every candidate against every CV fold) and instead
+        scores each candidate's folds sequentially, abandoning the remaining
+        folds for a candidate once ``cv_quit_after_n_folds`` folds look
+        clearly worse than the best fully-evaluated candidate so far. Does
+        not support ``return_train_score`` or sample-aligned fit params
+        (sample_weight etc.) — add if/when needed.
+        """
+        from sklearn.model_selection._validation import _fit_and_score
+        from sklearn.model_selection import check_cv
+        from sklearn.base import clone, is_classifier
+        from sklearn.utils.validation import indexable
+        from joblib import Parallel, delayed
+
+        estimator = self.estimator
+        scorer = check_scoring(estimator, scoring=self.scoring)
+        self.scorer_ = scorer
+
+        X, y = indexable(X, y)
+        cv_orig = check_cv(self.cv, y, classifier=is_classifier(estimator))
+        splits = list(cv_orig.split(X, y, groups=groups))
+        n_splits = len(splits)
+        n_quit = min(self.cv_quit_after_n_folds, n_splits)
+        can_quit_early = n_quit < n_splits
+
+        all_candidate_params = []
+        all_rows = []
+        results = {}
+
+        def _current_quit_threshold():
+            full_means = [r['mean_test_score'] for r in all_rows
+                          if not r['early_quit']]
+            if len(full_means) < 1:
+                return None
+            best = max(full_means)
+            spread = (max(full_means) - min(full_means)) if len(full_means) > 1 \
+                else max(abs(best), 1e-6)
+            return best - self.cv_quit_margin * spread
+
+        def _eval_one(parameters):
+            split_scores = [np.nan] * n_splits
+            fit_times = [np.nan] * n_splits
+            early_quit = False
+            for split_idx, (train, test) in enumerate(splits):
+                est = clone(estimator)
+                est.set_params(**parameters)
+                res = _fit_and_score(
+                    est, X, y, scorer=scorer, train=train, test=test,
+                    verbose=self.verbose, parameters=parameters,
+                    fit_params=fit_params, score_params={},
+                    return_times=True, error_score=self.error_score)
+                split_scores[split_idx] = res['test_scores']
+                fit_times[split_idx] = res['fit_time']
+
+                if can_quit_early and (split_idx + 1) == n_quit:
+                    threshold = _current_quit_threshold()
+                    partial_mean = float(np.nanmean(split_scores))
+                    if threshold is not None and partial_mean < threshold:
+                        early_quit = True
+                        break
+
+            return {
+                'params': parameters,
+                'split_scores': split_scores,
+                'mean_test_score': float(np.nanmean(split_scores)),
+                'std_test_score': float(np.nanstd(split_scores)),
+                'mean_fit_time': float(np.nanmean(fit_times)),
+                'n_folds_evaluated': (n_quit if early_quit else n_splits),
+                'early_quit': early_quit,
+            }
+
+        def evaluate_candidates(candidate_params):
+            nonlocal results
+            candidate_params = list(candidate_params)
+            rows = Parallel(n_jobs=self.n_jobs, pre_dispatch=self.pre_dispatch)(
+                delayed(_eval_one)(p) for p in candidate_params)
+
+            all_candidate_params.extend(candidate_params)
+            all_rows.extend(rows)
+
+            results = {
+                'params': list(all_candidate_params),
+                'mean_test_score': np.array([r['mean_test_score'] for r in all_rows]),
+                'std_test_score': np.array([r['std_test_score'] for r in all_rows]),
+                'mean_fit_time': np.array([r['mean_fit_time'] for r in all_rows]),
+                'n_folds_evaluated': np.array([r['n_folds_evaluated'] for r in all_rows]),
+                'early_quit': np.array([r['early_quit'] for r in all_rows]),
+            }
+            for split_idx in range(n_splits):
+                results[f'split{split_idx}_test_score'] = np.array(
+                    [r['split_scores'][split_idx] for r in all_rows])
+            return results
+
+        self._run_search(evaluate_candidates)
+
+        if not all_rows:
+            raise ValueError('No fits were performed. Was the CV iterator '
+                             'empty? Were there no candidates?')
+
+        n_early_quit = int(np.sum(results['early_quit']))
+        if n_early_quit:
+            logger_msg = (f'cv_quit_early: {n_early_quit}/{len(all_rows)} '
+                         f'candidates abandoned after {n_quit}/{n_splits} '
+                         f'folds.')
+            warnings.warn(logger_msg)
+
+        self.cv_results_ = results
+        self.n_splits_ = n_splits
+        self.best_index_ = int(np.argmax(results['mean_test_score']))
+        self.best_score_ = float(results['mean_test_score'][self.best_index_])
+        self.best_params_ = results['params'][self.best_index_]
+
+        if self.refit:
+            self.best_estimator_ = clone(estimator)
+            self.best_estimator_.set_params(**self.best_params_)
+            if y is not None:
+                self.best_estimator_.fit(X, y, **fit_params)
+            else:
+                self.best_estimator_.fit(X, **fit_params)
+
+        return self
+
+
+class BayesSearchCV(_CVQuitEarlyMixin, BaseSearchCV):
     """Bayesian optimization over hyper parameters.
 
     BayesSearchCV implements a "fit" and a "score" method.
@@ -135,6 +272,32 @@ class BayesSearchCV(BaseSearchCV):
 
     progress_bar : boolean, default=True
         If ``True``, a progress bar is shown during the search.
+
+    cv_quit_early : bool, default=False
+        If True, evaluate each candidate's CV folds sequentially and
+        abandon the remaining folds once ``cv_quit_after_n_folds`` have
+        been scored and the partial mean is judged "bad" relative to the
+        best fully-evaluated candidate seen so far (see
+        ``cv_quit_margin``). Skipped folds are recorded as NaN in
+        ``cv_results_`` and the candidate's ``mean_test_score`` is the
+        mean of the folds that *were* run, so early-quit candidates are
+        still comparable (if pessimistic) for the optimizer's ``tell()``.
+        Only takes effect once at least one candidate has completed all
+        folds (there's nothing to compare against before that).
+
+    cv_quit_after_n_folds : int, default=3
+        Number of folds to run before checking whether to quit early.
+        Ignored if ``cv_quit_early`` is False, or if the CV splitter
+        produces this many folds or fewer (nothing to quit early from).
+
+    cv_quit_margin : float, default=0.5
+        Tolerance band, as a fraction of the observed spread of fully-
+        evaluated candidates' mean scores. A candidate quits early when
+        its partial mean score falls below
+        ``best_full_mean_score - cv_quit_margin * score_spread``
+        (scores are "higher is better", matching sklearn scorer
+        convention — e.g. ``neg_brier_score``). Larger values prune more
+        aggressively.
 
     random_state : int or RandomState
         Pseudo random number generator state used for random uniform sampling
@@ -284,10 +447,12 @@ class BayesSearchCV(BaseSearchCV):
 
     def __init__(self, estimator, search_spaces, optimizer_kwargs=None,
                  n_iter=50, scoring=None, fit_params=None, n_jobs=1,
-                 n_points=1, iid='deprecated', refit=True, cv=None, 
+                 n_points=1, iid='deprecated', refit=True, cv=None,
                  verbose=0, progress_bar=True,
                  pre_dispatch='2*n_jobs', random_state=None,
-                 error_score='raise', return_train_score=False):
+                 error_score='raise', return_train_score=False,
+                 cv_quit_early=False, cv_quit_after_n_folds=3,
+                 cv_quit_margin=0.5):
 
         self.search_spaces = search_spaces
         self.n_iter = n_iter
@@ -305,6 +470,10 @@ class BayesSearchCV(BaseSearchCV):
             warnings.warn("The `iid` parameter has been deprecated "
                           "and will be ignored.")
         self.iid = iid  # For sklearn repr pprint
+
+        self.cv_quit_early = cv_quit_early
+        self.cv_quit_after_n_folds = cv_quit_after_n_folds
+        self.cv_quit_margin = cv_quit_margin
 
         super(BayesSearchCV, self).__init__(
              estimator=estimator, scoring=scoring,
@@ -469,11 +638,14 @@ class BayesSearchCV(BaseSearchCV):
         else:
             self.optimizer_kwargs_ = dict(self.optimizer_kwargs)
 
-        super().fit(X=X, y=y, groups=groups, **fit_params)
+        if self.cv_quit_early:
+            self._fit_with_cv_quit_early(X, y=y, groups=groups, **fit_params)
+        else:
+            super().fit(X=X, y=y, groups=groups, **fit_params)
 
         # BaseSearchCV never ranked train scores,
         # but apparently we used to ship this (back-compat)
-        if self.return_train_score:
+        if self.return_train_score and not self.cv_quit_early:
             self.cv_results_["rank_train_score"] = \
                 rankdata(-np.array(self.cv_results_["mean_train_score"]),
                          method='min').astype(int)
@@ -529,7 +701,7 @@ class BayesSearchCV(BaseSearchCV):
                             med = np.median(-optim_result['func_vals'])
                             progress.set_description(f"{self.__class__.__name__} across {n_iter} "
                                                      "(remaining) test points "
-                                                     f"[best score: {score:.3g}, median: {med:.3g})")
+                                                     f"[best score: {score:.3g}, median: {med:.3g}]")
                             # if score >= 0.99:
                             #     # progress.close()
                             #     print('Interrupting!')
@@ -556,3 +728,56 @@ class BayesSearchCV(BaseSearchCV):
             self._optim_results.append(optim_result)
             if progress is not None:
                 progress.close()
+
+class GridSearchCV(_CVQuitEarlyMixin, _SkGridSearchCV):
+    """``sklearn.model_selection.GridSearchCV`` with the same
+    ``cv_quit_early`` early-abandonment option as :class:`BayesSearchCV`.
+    See :class:`BayesSearchCV` for the three added parameters' docs.
+    """
+
+    def __init__(self, estimator, param_grid, *, scoring=None, n_jobs=None,
+                 refit=True, cv=None, verbose=0, pre_dispatch='2*n_jobs',
+                 error_score=np.nan, return_train_score=False,
+                 cv_quit_early=False, cv_quit_after_n_folds=3,
+                 cv_quit_margin=0.5):
+        self.cv_quit_early = cv_quit_early
+        self.cv_quit_after_n_folds = cv_quit_after_n_folds
+        self.cv_quit_margin = cv_quit_margin
+        super().__init__(
+            estimator=estimator, param_grid=param_grid, scoring=scoring,
+            n_jobs=n_jobs, refit=refit, cv=cv, verbose=verbose,
+            pre_dispatch=pre_dispatch, error_score=error_score,
+            return_train_score=return_train_score)
+
+    def fit(self, X, y=None, *, groups=None, **fit_params):
+        if self.cv_quit_early:
+            return self._fit_with_cv_quit_early(X, y=y, groups=groups, **fit_params)
+        return super().fit(X, y=y, groups=groups, **fit_params)
+
+
+class RandomizedSearchCV(_CVQuitEarlyMixin, _SkRandomizedSearchCV):
+    """``sklearn.model_selection.RandomizedSearchCV`` with the same
+    ``cv_quit_early`` early-abandonment option as :class:`BayesSearchCV`.
+    See :class:`BayesSearchCV` for the three added parameters' docs.
+    """
+
+    def __init__(self, estimator, param_distributions, *, n_iter=10,
+                 scoring=None, n_jobs=None, refit=True, cv=None, verbose=0,
+                 pre_dispatch='2*n_jobs', random_state=None,
+                 error_score=np.nan, return_train_score=False,
+                 cv_quit_early=False, cv_quit_after_n_folds=3,
+                 cv_quit_margin=0.5):
+        self.cv_quit_early = cv_quit_early
+        self.cv_quit_after_n_folds = cv_quit_after_n_folds
+        self.cv_quit_margin = cv_quit_margin
+        super().__init__(
+            estimator=estimator, param_distributions=param_distributions,
+            n_iter=n_iter, scoring=scoring, n_jobs=n_jobs, refit=refit,
+            cv=cv, verbose=verbose, pre_dispatch=pre_dispatch,
+            random_state=random_state, error_score=error_score,
+            return_train_score=return_train_score)
+
+    def fit(self, X, y=None, *, groups=None, **fit_params):
+        if self.cv_quit_early:
+            return self._fit_with_cv_quit_early(X, y=y, groups=groups, **fit_params)
+        return super().fit(X, y=y, groups=groups, **fit_params)
